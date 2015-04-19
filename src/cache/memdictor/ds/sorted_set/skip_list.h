@@ -394,8 +394,16 @@ public:
 
     sl_iterator(const node_type* node): mp_node(node) {}
 
-    node_type operator*() const noexcept {
-        return *(operator->());
+    bool operator== (const self_type& other) {
+        return mp_node == other.mp_node;
+    }
+
+    bool operator!= (const self_type& other) {
+        return mp_node != other.mp_node;
+    }
+
+    const node_type& operator*() const noexcept {
+        return *(this->operator->());
     }
 
     const node_type* operator->() const noexcept {

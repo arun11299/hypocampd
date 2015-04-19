@@ -19,6 +19,8 @@ void test_random() {
         std::cout << (int)h.new_height() << std::endl;
 }
 
+void test_iterator(SkipList<std::string, int>& list) ;
+
 bool test_skip_list() {
     std::cout << "Testing skip list" << std::endl;
     std::string* max_key = new std::string("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
@@ -63,12 +65,27 @@ bool test_skip_list() {
     std::string* str12 = new std::string("try12");
     list.insert(str12, new int(10));
 
-list.__dump__();
     std::cout << "Finding: " << list.find(str) << std::endl;
 
     list.remove(str);
 
     std::cout << "Finding: " << list.find(str) << std::endl;
+    list.remove(str1);
+    list.__dump__();
+
+
+    test_iterator(list);
+}
+
+void test_iterator(SkipList<std::string, int>& list) {
+
+    std::cout << "Iterator Testing" << std::endl;
+
+    SkipList<std::string, int>::iterator it = list.begin();
+
+    for (; it != list.end(); ++it) {
+        std::cout << *((*it).get_key()) << std::endl;
+    }
 }
 
 int main() {
