@@ -1,0 +1,447 @@
+#ifndef HYPOCAMPD_CUCKOO_HASH_H
+#define HYPOCAMPD_CUCKOO_HASH_H
+
+#include <type_traits>
+#include <utility>
+#include "common/murmurhash3.h"
+#include "common/spinlock.h"
+#include "common/aligned_storage.h"
+#include "common/logger.h"
+
+#define SLOTS_PER_BUCKET 8
+#define DEFAULT_SIZE 500
+
+namespace hypocampd {
+
+    
+    class Bucket {
+    public:
+        explicit Bucket() { m_occupied.reset(); }
+
+        bool is_occupied(int idx) const noexcept {
+            return m_occupied.test(idx);
+        }
+
+        int8_t first_unoccupied_pos() const noexcept {
+
+            for (int8_t i = 0; i < SLOTS_PER_BUCKET; i++) {
+                if (m_occupied.test(i)) return i;
+            }
+            return -1;
+        }
+
+        const key_t& get_key(int idx) const {
+            return m_keys[idx].object();
+        }
+
+        key_t& get_key(int idx) {
+            return m_keys[idx].object();
+        }
+
+        const val_t& get_val(int idx) const {
+            return m_vals[idx].object();
+        }
+
+        val_t& get_val(int idx) {
+            return m_vals[idx].object();
+        }
+
+        void set_kv(uint8_t pos, const key_type& key, const val_t& val) {
+            m_keys[pos] = std::move(AlStore<key_t>(key));
+            m_vals[pos] = std::move(AlStore<val_t>(val));
+            m_occupied.set(pos);
+        }
+
+        void erase_kv(uint8_t pos) {
+            m_keys[pos].~AlStore();
+            m_vals[pos].~AlStore();
+            m_occupied.reset(pos);
+        }
+
+    private:
+        std::array<AlStore<key_t>, SLOTS_PER_BUCKET> m_keys;
+        std::array<AlStore<val_t>, SLOTS_PER_BUCKET> m_vals;
+        std::bitset<SLOTS_PER_BUCKET> m_occupied;
+
+    };
+
+
+    struct b_slot {
+        // The bucket of the last item in the path
+        size_t bucket;
+        // Compressed repr of the slots for each of the 
+        // buckets in the path
+        size_t pathcode;
+        int depth;
+        b_slot() {}
+        b_slot(const size_t b, const size_t p, const int d)
+                : bucket(b), pathcode(p), depth(d) {}
+
+    }__attribute((__packed__));
+
+
+    class b_queue {
+        b_slot slots[MAX_CUCKOO_COUNT+1];
+        size_t first;
+        size_t last;
+
+    public:
+        b_queue() : first(0), last(0) {}
+
+
+        void enqueue(b_slot x) { 
+            slots[last] = x; 
+            last = (last == MAX_CUCKOO_COUNT) ? 0 : last+1;
+            assert(last != first);
+        }
+
+        b_slot dequeue() {
+            assert(first != last);
+            b_slot& x = slots[first];
+            first = (first == MAX_CUCKOO_COUNT) ? 0 : first+1;
+            return x;
+        }
+
+        bool not_full() {
+            const size_t next = (last == MAX_CUCKOO_COUNT) ? 0 : last+1;
+            return next != first;
+        }
+    } __attribute__((__packed__));
+            
+
+    template <typename KeyT, typename ValueT, 
+              typename HashT = MurmurHash,
+              typename Pred = std::equal_to<KeyT>>
+    class CuckooHash {
+    public:
+        using key_t = KeyT;
+        using val_t = ValueT;
+        using entry_t = std::pair<key_t, val_t>;
+        using key_equal = Pred;
+
+    public:
+        // Error Codes
+        typedef enum {
+            success = 0,
+            key_not_found =  1,
+            duplicate_key = 2,
+            insert_error  = 3,
+            update_error  = 4,
+            table_under_exapansion = 5,
+            table_full = 6,
+        } cuckoo_status;
+
+        // Exposed Hash functions
+        explicit CuckooHash(size_t num_elements = DEFAULT_SIZE) {
+            size_t hash_power = calc_hash_power(num_elements);
+            mp_tblinfo.store(new TableInfo(hash_power));
+            clear_table(mp_tblinfo.load());
+        }
+ 
+        val_t find(const key_t& key) {
+            val_t value;
+            bool ret = find(key, value);
+            if (ret) {
+                return value;
+            } else {
+                throw std::out_of_range("Key not found");
+            }
+        }
+
+        bool find(const key_t& key, val_t& val) {
+            size_t hash_v = m_hasher(key);
+            size_t idx1, idx2;
+            TableInfo* ti;
+
+            //std::tie(ti, idx1, idx2) = snapshot_and_lock_two(hash_v);
+            cuckoo_status ret = cuckoo_find(key, val, mp_tblinfo.load(), 
+                                            idx1, idx2);
+            return (ret == ok);
+        }
+
+        bool insert(const key_t& key, const val_t& val) {
+            TableInfo* tinfo;
+            size_t idx1, idx2;
+            size_t hash_v = m_hasher(key);
+
+            std::tie(tinfo, idx1, idx2) = snapshot_and_lock_two(hash_v);
+            return cuckoo_insert(key, val, hash_v, tinfo, idx1, idx2);
+        }
+
+        bool update();
+
+    private:
+        size_t calc_hash_power(size_t no_elems) noexcept {
+            double hp = ceil(log2((double) no_elems/ (double) SLOTS_PER_BUCKET));
+            size_t nhp = (size_t) (hp <= 0 ? 1.0 : hp);
+            return nhp;
+        }
+
+        size_t hash_size(size_t hash_power) noexcept {
+            return 1 << hash_power;
+        }
+
+        cuckoo_status clear_table(TableInfo* tinfo) {
+            return tinfo->clear(); 
+        }
+
+        size_t index_hash(const TableInfo* ti, size_t hv) noexcept {
+            return hv & ((1 << ti->m_hashpower) -1);
+        }
+
+        size_t alt_index(const TableInfo* ti, size_t hv, size_t idx) noexcept {
+            const size_t tag = (hv >> ti->hashpower_) + 1;
+            // 0x5bd1e995 is the hash constant from MurmurHash2
+            return (index ^ (tag * 0x5bd1e995)) & ((1 << ti->m_hashpower) -1);
+        }
+
+        std::tuple<TableInfo*, size_t, size_t>
+        snapshot_and_lock_two(size_t hash_value) {
+            size_t idx1, idx2;
+            TableInfo* ti = mp_tblinfo.load();
+            idx1 = index_hash(ti, hash_value);
+            idx2 = alt_index(ti, hash_value, idx1);
+            
+            return std::make_tuple(ti, idx1, idx2);
+        }
+
+        bool try_read_from_bucket(TableInfo* ti, size_t index, const key_t& key,
+                                  val_t& value) {
+            for (size_t i = 0; i < SLOTS_PER_BUCKET; i++) {
+                if (!ti->m_buckets[index].is_occupied(i)) continue;
+
+                if (m_eqfn(key, ti->m_buckets[index].get_key(i))) {
+                    val = ti->m_buckets[index].get_val(i);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        cuckoo_status cuckoo_find(const key_t& key, val_t& value, TableInfo* tinfo,
+                                  size_t idx1, size_t idx2)
+        {   
+            if (try_read_from_bucket(tinfo, idx1, key, value)) {
+                return ok; 
+            }
+            else if (try_read_from_bucket(tinfo, idx2, key, value)) {
+                return ok;
+            }
+
+            return key_not_found;
+        }
+
+        void add_to_bucket(TableInfo* tinfo, const size_t idx, const key_t& key, 
+                           const val_t& val) 
+        {
+            int8_t pos = tinfo->m_buckets[idx].first_unoccupied_pos();
+            if (pos == -1) {
+                // Should have come here
+                return;
+            }
+            tinfo->m_buckets[idx].set_kv(pos, key, val);
+        }
+
+        bool check_for_free_slot(TableInfo* tinfo, const key_t& key, const size_t idx, int& pos) 
+        {
+            pos = -1; bool found = false;
+
+            for (int i = 0; i < SLOTS_PER_BUCKET; i++) {
+                if (tinfo->m_buckets[idx].is_occupied(i)) {
+                    if ( m_eqfn(tinfo->m_buckets[idx].get_key(i), key) )  
+                        return false; // Duplicate Key
+                } else {
+                    if (!found) pos = i;
+                }
+            }
+
+            return true;
+        }
+
+        b_slot slot_search(TableInfo* tinfo, const size_t idx1, const size_t idx2) 
+        {
+            b_queue q;
+            q.enqueue(b_slot(idx1, 0, 0));
+            q.enqueue(b_slot(idx2, 1, 0));
+
+            while ( q.not_full() ) {
+
+                b_slot x = q.dequeue();
+                for (size_t slot = 0; slot < SLOT_PER_BUCKET && q.not_full();
+                    ++size) {
+
+                    if (!tinfo->m_buckets[x.bucket].is_occupied(slot) ) {
+                        x.pathcode = x.pathcode * SLOT_PER_BUCKET + slot;
+                        return x; 
+                    }
+
+                    const size_t hv = m_hasher(tinfo->m_buckets[x.bucket].get_key(slot)); 
+                    b_slot y(alt_index(ti, hv, x.bucket),
+                                x.pathcode * SLOT_PER_BUCKET + slot, x.depth+1);
+
+                    for (size_t j = 0; j < SLOT_PER_BUCKET; ++j) {
+                        if (!tinfo->m_buckets[y.bucket].is_occupied(j) ) {
+                            y.pathcode = y.pathcode * SLOT_PER_BUCKET + j;
+                            return y;
+                        }
+                    }
+
+                    if (y.depth != static_cast<int>(MAX_BFS_DEPTH)) {
+                        q.enqueue(y);
+                    }
+
+                }
+            } // END while 
+
+            return b_slot(0 , 0, -1);
+        }
+
+        int cuckoopath_search (TableInfo* tinfo, CuckooRecord* cuckoo_path, 
+                               const size_t idx1, const size_t idx2) 
+        {
+            b_slot res = slot_search(tinfo, idx1, idx2);
+            if (x.depth == -1) {
+                return -1;
+            }
+            // Fill in the cuckoo path slots from the end to the beginning
+            for (int i = x.depth; i >= 0; i--) {
+                cuckoo_path[i].slot = x.pathcode % SLOT_PER_BUCKET;
+                x.pathcode /= SLOT_PER_BUCKET;
+            }
+
+            CuckooRecord* curr = cuckoo_path;
+            if (x.pathcode == 0) {
+                curr->bucket = i1;
+                if (!tinfo->m_buckets[curr->bucket].is_occupied(curr->slot)) {
+                    // We can terminate here
+                    return 0;
+                }
+                curr->key = tinfo->m_buckets[curr->bucket].get_key(curr->slot);
+            } else {
+                assert(x.pathcode == 1);
+                curr->bucket = i2;
+                if (!tinfo->m_buckets[curr->bucket].is_occupied(curr->slot)) {
+                    // We can terminate here
+                    return 0;
+                }
+                curr->key = tinfo->m_buckets[curr->bucket].get_key(curr->slot);
+            }
+
+            for (int i = 1; i <= x.depth; ++i) {
+                CuckooRecord* prev = curr++;
+                const size_t prevhv = m_hasher(prev->key);
+                assert(prev->bucket == index_hash(ti, prevhv) ||
+                       prev->bucket == alt_index(ti, prevhv, index_hash(ti,
+                                                                    prevhv)));
+            // We get the bucket that this slot is on by computing the alternate
+            // index of the previous bucket
+            curr->bucket = alt_index(ti, prevhv, prev->bucket);
+            lock(ti, curr->bucket);
+            if (!ti->buckets_[curr->bucket].occupied(curr->slot)) {
+                // We can terminate here
+                unlock(ti, curr->bucket);
+                return i;
+            }
+            curr->key = ti->buckets_[curr->bucket].key(curr->slot);
+            unlock(ti, curr->bucket);
+        }
+        return x.depth;
+        }
+
+        cuckoo_status perform_cuckoo_hashing(TableInfo* tinfo, size_t idx1, size_t idx2,
+                                             size_t& bucket_no, size_t& slot_no) 
+        {
+            CuckooRecord cuckoo_path[MAX_BFS_DEPTH+1];
+            bool done = false;
+
+            while (!done) {
+                int depth = cuckoopath_search(tinfo, cuckoo_path, idx1, idx2);
+                if (depth < 0) break;
+
+                if (cuckoopath_move(tinfo, cuckoo_path, depth, idx1, idx2)) {
+                        bucket_no = cuckoo_path[0].bucket;
+                        slot_no = cuckoo_path[0].slot; 
+                        assert(!tinfo->m_buckets[bucket_no].is_occupied(slot_no));
+                        done = true;
+                        break;
+                }
+            } // END while
+
+            if (!done) return failure;
+            else if ( tinfo != table_info.load() ) return failure_under_expansion;
+
+            return ok;
+        }
+
+        cuckoo_status do_simple_insert(const key_t& key, const val_t& val, size_t hash_v,
+                                       TableInfo* ti, const size_t idx1, const size_t idx2)
+        {
+            int pos;
+            if ( !check_for_free_slot(tinfo, key, idx1, pos) ) {
+                // Duplicate key found
+                return duplicate_key;
+            }
+
+            if (pos != -1) {
+                add_to_bucket(tinfo, idx1, key, val);
+                return ok;
+            }
+
+            if ( !check_for_free_slot(tinfo, key, idx2, pos) ) {
+                // Duplicate key found at alternate position
+                return duplicate_key;
+            }
+
+            if (pos != -1) {
+                add_to_bucket(tinfo, idx2, key, val);
+                return ok;
+            }
+
+            // If we are here, that means we will have to 
+            // do cuckoo hashing till we find the place to insert
+            size_t bucket_no = 0;
+            size_t slot_no = 0;
+
+            cuckoo_status status = perform_cuckoo_hashing(tinfo, idx1, idx2, 
+                                                          bucket_no, slot_no);
+            
+        }
+
+        cuckoo_status cuckoo_insert(const key_t& key, const val_t& val, size_t hash_v,
+                                    TableInfo* tinfo, const size_t idx1, const size_t idx2) 
+        {
+            cuckoo_status res = do_simple_insert(key, val, hash_v, tinfo, idx1, idx2);
+        }
+
+    private: 
+        const bool is_simple_key = 
+                    std::is_pod<key_t>::value && sizeof(key_t) <= 8;
+        const size_t num_locks = 1 << 13;
+        const size_t num_cores = 1;
+        const size_t MAX_CUCKOO_LKP = 500;
+        const size_t MAX_BFS_DEPTH  = 4;
+
+        struct TableInfo {
+        public:
+            explicit TableInfo(size_t hash_power): m_hashpower(hash_power),
+                                                   m_buckets(hashsize(m_hashpower)) {
+            }
+            cuckoo_status clear() {
+                m_buckets.clear();
+                return success;
+            }
+            
+            size_t m_hashpower;
+            std::vector<Bucket> m_buckets;
+            std::array<SpinLock, num_locks> m_locks;
+        };
+
+        std::atomic<TableInfo*> mp_tblinfo;
+        HashT m_hasher;
+        key_equal m_eqfn;
+
+    };
+
+}; // END namespace hypocampd
+
+#endif

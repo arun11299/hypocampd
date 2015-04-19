@@ -1,0 +1,4 @@
+test.cc: In function ‘bool test_skip_list()’:
+test.cc:40:1: warning: no return statement in function returning non-void [-Wreturn-type]
+ }
+ ^
