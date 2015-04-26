@@ -51,7 +51,7 @@ public:
 
 private:
     uint8_t m_height;
-    float m_probability;
+    float   m_probability;
 };
 
 
@@ -138,7 +138,7 @@ private:
     std::unique_ptr<const Value_T> mp_value = nullptr;
     uint8_t m_height;
 
-public: // I hate doing this !!
+public: // I hate doing this !! This should be private !!
     // Pointers/link to other nodes at different levels
     std::unique_ptr<self_type*[]> mp_fwd_nodes;
 };
